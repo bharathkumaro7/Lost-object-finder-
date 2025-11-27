@@ -5,3 +5,4 @@ ultralytics>=8.0.0
 torch
 torchvision
 Pillow
+gunicorn
