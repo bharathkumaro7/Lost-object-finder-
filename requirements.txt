@@ -1,0 +1,7 @@
+Flask==2.2.5
+opencv-contrib-python==4.8.0.76
+numpy==1.25.2
+ultralytics>=8.0.0
+torch
+torchvision
+Pillow
