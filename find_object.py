@@ -2,55 +2,15 @@ import cv2
 import numpy as np
 import os
 from PIL import Image
-import torch
-import torchvision.transforms as transforms
-from torchvision import models
-
-# Global feature extractor
-feature_model = None
-transform = None
-
-def load_feature_extractor():
-    """Load a pre-trained CNN for feature extraction."""
-    global feature_model, transform
-    if feature_model is None:
-        print("[INFO] Loading feature extraction model...")
-        # Use ResNet18 - lightweight but effective
-        feature_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        # Remove the final classification layer to get features
-        feature_model = torch.nn.Sequential(*list(feature_model.children())[:-1])
-        feature_model.eval()
-        
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        print("[INFO] Feature extraction model loaded!")
-    return feature_model, transform
-
-
-def extract_features(image, model, transform):
-    """Extract CNN features from an image."""
-    if isinstance(image, np.ndarray):
-        image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    
-    img_tensor = transform(image).unsqueeze(0)
-    
-    with torch.no_grad():
-        features = model(img_tensor)
-    
-    return features.flatten().numpy()
 
 
 def find_object_in_scene(template_path, scene_path, min_matches=4, debug=True):
     """
-    Find the template object in the scene using sliding window + CNN similarity.
+    Find the template object in the scene using multiple OpenCV methods.
+    Optimized for low memory usage.
     """
     print(f"\n{'='*60}")
     print(f"[INFO] Looking for your lost object...")
-    print(f"[INFO] Template: {template_path}")
-    print(f"[INFO] Scene: {scene_path}")
     
     if not os.path.exists(template_path):
         return None, "Template file not found"
@@ -63,184 +23,224 @@ def find_object_in_scene(template_path, scene_path, min_matches=4, debug=True):
     if template is None or scene is None:
         return None, "Could not read images"
     
+    # Resize if images are too large (save memory)
+    max_dim = 800
+    template = resize_if_needed(template, max_dim)
+    scene = resize_if_needed(scene, max_dim)
+    
     print(f"[INFO] Template size: {template.shape[:2]}")
     print(f"[INFO] Scene size: {scene.shape[:2]}")
     
-    # Load the feature extractor
-    model, trans = load_feature_extractor()
+    # Method 1: Multi-scale template matching
+    result, msg = multi_scale_template_match(template, scene)
+    if result is not None:
+        return result, msg
     
-    # Extract template features
-    print("[INFO] Analyzing your lost object...")
-    template_features = extract_features(template, model, trans)
+    # Method 2: Feature matching (ORB - no extra dependencies)
+    result, msg = orb_feature_match(template, scene)
+    if result is not None:
+        return result, msg
     
-    # Search using sliding window at multiple scales
-    print("[INFO] Searching the scene...")
-    best_match = sliding_window_search(template, scene, template_features, model, trans)
+    # Method 3: Color-based search
+    result, msg = color_histogram_search(template, scene)
+    if result is not None:
+        return result, msg
     
-    if best_match is not None:
-        x, y, w, h, similarity = best_match
-        out = scene.copy()
-        draw_result(out, x, y, w, h, similarity)
+    return None, "Object not found. Try a different image or angle."
+
+
+def resize_if_needed(img, max_dim):
+    """Resize image if larger than max_dim to save memory."""
+    h, w = img.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        return cv2.resize(img, (new_w, new_h))
+    return img
+
+
+def multi_scale_template_match(template, scene):
+    """Multi-scale template matching."""
+    t_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    s_gray = cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY)
+    
+    best_val = 0
+    best_loc = None
+    best_size = None
+    
+    # Try different scales
+    for scale in np.linspace(0.2, 2.0, 20):
+        new_w = int(template.shape[1] * scale)
+        new_h = int(template.shape[0] * scale)
         
-        if similarity > 0.7:
-            return out, f"🎉 Found your object! Similarity: {similarity*100:.0f}%"
-        elif similarity > 0.5:
-            return out, f"Possible match found. Similarity: {similarity*100:.0f}%"
-        else:
-            return out, f"Best guess location. Similarity: {similarity*100:.0f}%"
+        if new_w < 20 or new_h < 20:
+            continue
+        if new_w >= scene.shape[1] or new_h >= scene.shape[0]:
+            continue
+        
+        resized = cv2.resize(t_gray, (new_w, new_h))
+        
+        try:
+            result = cv2.matchTemplate(s_gray, resized, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            
+            if max_val > best_val:
+                best_val = max_val
+                best_loc = max_loc
+                best_size = (new_w, new_h)
+        except:
+            continue
     
-    return None, "Could not locate the object. Try a different scene image."
+    print(f"[INFO] Template match score: {best_val:.2f}")
+    
+    if best_val > 0.5 and best_loc:
+        out = scene.copy()
+        x, y = best_loc
+        w, h = best_size
+        draw_result(out, x, y, w, h, best_val)
+        return out, f"Object found! Confidence: {best_val*100:.0f}%"
+    
+    return None, f"Template match: {best_val*100:.0f}%"
 
 
-def sliding_window_search(template, scene, template_features, model, trans):
-    """
-    Search for template in scene using sliding windows at multiple scales.
-    """
+def orb_feature_match(template, scene):
+    """ORB feature matching."""
+    t_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    s_gray = cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY)
+    
+    orb = cv2.ORB_create(nfeatures=1000)
+    kp1, des1 = orb.detectAndCompute(t_gray, None)
+    kp2, des2 = orb.detectAndCompute(s_gray, None)
+    
+    if des1 is None or des2 is None:
+        return None, "Could not detect features"
+    
+    if len(kp1) < 4 or len(kp2) < 4:
+        return None, "Not enough features"
+    
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    try:
+        matches = bf.knnMatch(des1, des2, k=2)
+    except:
+        return None, "Matching failed"
+    
+    good = []
+    for m_n in matches:
+        if len(m_n) == 2:
+            m, n = m_n
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+    
+    print(f"[INFO] ORB matches: {len(good)}")
+    
+    if len(good) >= 8:
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        
+        if M is not None:
+            h, w = t_gray.shape
+            pts = np.float32([[0, 0], [0, h-1], [w-1, h-1], [w-1, 0]]).reshape(-1, 1, 2)
+            
+            try:
+                dst = cv2.perspectiveTransform(pts, M)
+                area = cv2.contourArea(dst)
+                
+                if 100 < area < scene.shape[0] * scene.shape[1] * 0.8:
+                    out = scene.copy()
+                    cv2.polylines(out, [np.int32(dst)], True, (0, 255, 0), 3)
+                    
+                    center = np.mean(dst, axis=0).astype(int)[0]
+                    cv2.circle(out, tuple(center), 12, (0, 0, 255), -1)
+                    
+                    # Add label
+                    cv2.putText(out, f"FOUND ({len(good)} matches)", 
+                               (int(dst[0][0][0]), int(dst[0][0][1]) - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    
+                    return out, f"Object found! {len(good)} feature matches"
+            except:
+                pass
+    
+    return None, f"Feature matching: {len(good)} matches"
+
+
+def color_histogram_search(template, scene):
+    """Search using color histogram."""
+    t_hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+    s_hsv = cv2.cvtColor(scene, cv2.COLOR_BGR2HSV)
+    
+    t_hist = cv2.calcHist([t_hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+    cv2.normalize(t_hist, t_hist, 0, 1, cv2.NORM_MINMAX)
+    
     th, tw = template.shape[:2]
     sh, sw = scene.shape[:2]
     
-    # Calculate aspect ratio of template
-    aspect_ratio = tw / th
+    best_score = 0
+    best_loc = None
+    best_size = None
     
-    best_similarity = 0
-    best_match = None
+    step = 30
     
-    # Try multiple scales relative to scene size
-    min_size = 50
-    max_size = min(sh, sw) - 20
-    
-    # Generate window sizes based on template aspect ratio
-    sizes = []
-    for size in range(min_size, max_size, max(20, (max_size - min_size) // 15)):
-        win_h = size
-        win_w = int(size * aspect_ratio)
-        if win_w < min_size:
-            win_w = min_size
-            win_h = int(win_w / aspect_ratio)
-        if win_w < sw and win_h < sh:
-            sizes.append((win_w, win_h))
-    
-    # Also add sizes based on original template dimensions
-    for scale in [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]:
+    for scale in [0.5, 0.75, 1.0, 1.25, 1.5]:
         win_w = int(tw * scale)
         win_h = int(th * scale)
-        if min_size <= win_w < sw and min_size <= win_h < sh:
-            sizes.append((win_w, win_h))
-    
-    # Remove duplicates and sort
-    sizes = list(set(sizes))
-    
-    total_windows = 0
-    step_factor = 0.25  # Overlap factor
-    
-    print(f"[INFO] Checking {len(sizes)} different scales...")
-    
-    for win_w, win_h in sizes:
-        step_x = max(10, int(win_w * step_factor))
-        step_y = max(10, int(win_h * step_factor))
         
-        for y in range(0, sh - win_h, step_y):
-            for x in range(0, sw - win_w, step_x):
-                total_windows += 1
+        if win_w >= sw or win_h >= sh or win_w < 30 or win_h < 30:
+            continue
+        
+        for y in range(0, sh - win_h, step):
+            for x in range(0, sw - win_w, step):
+                roi = s_hsv[y:y+win_h, x:x+win_w]
+                roi_hist = cv2.calcHist([roi], [0, 1], None, [30, 32], [0, 180, 0, 256])
+                cv2.normalize(roi_hist, roi_hist, 0, 1, cv2.NORM_MINMAX)
                 
-                # Extract window
-                window = scene[y:y+win_h, x:x+win_w]
+                score = cv2.compareHist(t_hist, roi_hist, cv2.HISTCMP_CORREL)
                 
-                # Quick pre-filter: check if colors are similar enough
-                if not quick_color_check(template, window):
-                    continue
-                
-                # Extract features
-                window_features = extract_features(window, model, trans)
-                
-                # Calculate cosine similarity
-                similarity = cosine_similarity(template_features, window_features)
-                
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    best_match = (x, y, win_w, win_h, similarity)
-                    print(f"  [UPDATE] New best match: {similarity:.2%} at ({x}, {y})")
+                if score > best_score:
+                    best_score = score
+                    best_loc = (x, y)
+                    best_size = (win_w, win_h)
     
-    print(f"[INFO] Checked {total_windows} windows")
-    print(f"[INFO] Best similarity: {best_similarity:.2%}")
+    print(f"[INFO] Color match score: {best_score:.2f}")
     
-    if best_similarity > 0.3:  # Lower threshold to find something
-        return best_match
+    if best_score > 0.5 and best_loc:
+        out = scene.copy()
+        x, y = best_loc
+        w, h = best_size
+        draw_result(out, x, y, w, h, best_score)
+        return out, f"Object found by color! Confidence: {best_score*100:.0f}%"
     
-    return None
+    return None, f"Color match: {best_score*100:.0f}%"
 
 
-def quick_color_check(template, window, threshold=0.3):
-    """Quick color histogram comparison to filter obviously wrong windows."""
-    t_hsv = cv2.cvtColor(cv2.resize(template, (32, 32)), cv2.COLOR_BGR2HSV)
-    w_hsv = cv2.cvtColor(cv2.resize(window, (32, 32)), cv2.COLOR_BGR2HSV)
-    
-    t_hist = cv2.calcHist([t_hsv], [0, 1], None, [12, 12], [0, 180, 0, 256])
-    w_hist = cv2.calcHist([w_hsv], [0, 1], None, [12, 12], [0, 180, 0, 256])
-    
-    cv2.normalize(t_hist, t_hist)
-    cv2.normalize(w_hist, w_hist)
-    
-    score = cv2.compareHist(t_hist, w_hist, cv2.HISTCMP_CORREL)
-    return score > threshold
-
-
-def cosine_similarity(a, b):
-    """Calculate cosine similarity between two feature vectors."""
-    dot = np.dot(a, b)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0
-    return dot / (norm_a * norm_b)
-
-
-def draw_result(image, x, y, w, h, similarity):
-    """Draw the detection result on the image."""
+def draw_result(image, x, y, w, h, confidence):
+    """Draw detection result on image."""
     # Main rectangle
-    color = (0, 255, 0) if similarity > 0.6 else (0, 255, 255)
-    cv2.rectangle(image, (x, y), (x + w, y + h), color, 4)
+    cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 3)
     
     # Corner accents
     corner_len = min(w, h) // 4
-    thickness = 5
+    color = (0, 255, 0)
+    thickness = 4
     
-    # Top-left
     cv2.line(image, (x, y), (x + corner_len, y), color, thickness)
     cv2.line(image, (x, y), (x, y + corner_len), color, thickness)
-    # Top-right
     cv2.line(image, (x + w, y), (x + w - corner_len, y), color, thickness)
     cv2.line(image, (x + w, y), (x + w, y + corner_len), color, thickness)
-    # Bottom-left
     cv2.line(image, (x, y + h), (x + corner_len, y + h), color, thickness)
     cv2.line(image, (x, y + h), (x, y + h - corner_len), color, thickness)
-    # Bottom-right
     cv2.line(image, (x + w, y + h), (x + w - corner_len, y + h), color, thickness)
     cv2.line(image, (x + w, y + h), (x + w, y + h - corner_len), color, thickness)
     
-    # Center crosshair
+    # Center point
     cx, cy = x + w // 2, y + h // 2
-    cv2.circle(image, (cx, cy), 15, (0, 0, 255), -1)
-    cv2.circle(image, (cx, cy), 25, (0, 0, 255), 3)
-    cv2.line(image, (cx - 35, cy), (cx + 35, cy), (0, 0, 255), 2)
-    cv2.line(image, (cx, cy - 35), (cx, cy + 35), (0, 0, 255), 2)
+    cv2.circle(image, (cx, cy), 12, (0, 0, 255), -1)
     
-    # Label with background
-    label = f"FOUND HERE! {similarity*100:.0f}%"
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 1.0
-    font_thickness = 2
-    
-    (text_w, text_h), _ = cv2.getTextSize(label, font, font_scale, font_thickness)
-    
-    label_y = y - 20 if y > 60 else y + h + 40
-    
-    # Background
-    cv2.rectangle(image, (x - 5, label_y - text_h - 10), 
-                  (x + text_w + 10, label_y + 10), color, -1)
-    cv2.putText(image, label, (x, label_y), font, font_scale, (0, 0, 0), font_thickness)
-    
-    # Add arrow pointing to center
-    arrow_start = (cx, y - 50 if y > 100 else y + h + 50)
-    arrow_end = (cx, cy)
-    cv2.arrowedLine(image, arrow_start, arrow_end, (0, 0, 255), 3, tipLength=0.3)
+    # Label
+    label = f"FOUND {confidence*100:.0f}%"
+    label_y = y - 15 if y > 40 else y + h + 25
+    cv2.rectangle(image, (x - 2, label_y - 20), (x + 150, label_y + 5), (0, 255, 0), -1)
+    cv2.putText(image, label, (x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
